@@ -65,6 +65,10 @@ MAX_ALT_TIME_MINS = int(os.getenv("MAX_ALT_TIME_MINS", "720"))
 PARALLEL_SLOTS = int(os.getenv("PARALLEL_SLOTS", "3"))
 
 # Set up logging — logs/ directory with daily rotation
+# Reconfigure stdout to UTF-8 so non-cp1252 chars in scraped page text
+# (e.g. ﻿ BOM, emoji) don't crash the StreamHandler on Windows.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 _log_dir = Path(__file__).parent / "logs"
 _log_dir.mkdir(exist_ok=True)
 _log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -75,6 +79,7 @@ _log_file = TimedRotatingFileHandler(
     _log_dir / "booking_api.log",
     when="midnight",
     backupCount=30,
+    encoding="utf-8",
 )
 _log_file.suffix = "%Y-%m-%d.log"      # rolled files: booking_api.log.2026-04-05.log
 _log_file.setFormatter(_log_fmt)
