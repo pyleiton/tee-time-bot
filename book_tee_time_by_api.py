@@ -485,6 +485,8 @@ def add_to_cart(session, preferred_entry, rate_info, num_players, contact_id, se
     if not cart_resp:
         return None, None
 
+    log.info(f"  cart/add response body: {json.dumps(cart_resp)}")
+
     if not cart_resp.get("IsSuccessful"):
         error_msg = cart_resp.get('StatusMessage', 'unknown error')
         log.error(f"Cart add failed: {error_msg}")
