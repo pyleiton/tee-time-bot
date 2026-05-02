@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -301,6 +300,27 @@ def api_post(session, endpoint, body, desc=""):
     return r.json()
 
 
+def get_cart_items(session):
+    """GET /api/cart/getallitems — returns parsed JSON or None on failure.
+
+    Used to verify the actual seat count after a cart/add, since the
+    cart/add response body is a status envelope with no player count.
+    The definitive seat count is len(response["SlotItems"]).
+    """
+    return api_get(session, "/api/cart/getallitems", "get cart items")
+
+
+def clear_cart(session, session_id):
+    """POST /api/cart/removeall — empties the session's cart.
+
+    Called after detecting a partial-fill so the next slot attempt
+    starts with a clean cart.
+    """
+    return api_post(session, "/api/cart/removeall", {
+        "SessionID": session_id,
+    }, "clear cart")
+
+
 def group_tee_times(tee_times):
     """Group tee time entries by datetime (r15).
 
@@ -492,82 +512,79 @@ def add_to_cart(session, preferred_entry, rate_info, num_players, contact_id, se
         log.error(f"Cart add failed: {error_msg}")
         return None, error_msg
 
+    # The cart/add response has no player-count field — the server can
+    # silently accept fewer players than requested if seats were taken
+    # between search and cart/add. Verify via getallitems and reject any
+    # partial fill so the caller can try the next slot.
+    cart_items = get_cart_items(session)
+    if not cart_items:
+        log.warning("  getallitems failed after cart/add — clearing cart and rejecting")
+        clear_cart(session, session_id)
+        return None, "cart verification failed"
+
+    actual = len(cart_items.get("SlotItems", []))
+    if actual != num_players:
+        log.warning(f"  PARTIAL FILL: cart has {actual} of {num_players} requested players — clearing cart")
+        clear_cart(session, session_id)
+        return None, f"partial fill: {actual}/{num_players}"
+
+    log.info(f"  Cart confirmed with {actual} of {num_players} players")
     return cart_resp, None
 
 
-def try_book_slot(session, slot, session_id, csrf_token, contact_id, num_players, success_event):
-    """Try to book a single slot: reservation details → cart/add.
+def book_candidates(session, slots, session_id, csrf_token, contact_id, num_players):
+    """Fetch reservation details in parallel, then attempt cart/add sequentially.
 
-    Checks success_event before calling cart/add — if another thread already
-    won, this thread skips the cart/add to avoid holding extra tee times.
-
-    Returns (slot, cart_resp, error_msg).
-    """
-    display_time = slot["display_time"]
-    preferred_entry = get_preferred_entry(slot, PREFERRED_SPONSOR_ID)
-    if not preferred_entry:
-        return slot, None, "no preferred entry"
-
-    log.info(f"  [stagger] {display_time}: getting reservation details...")
-
-    rate_info = get_reservation_details(session, slot, session_id)
-    if not rate_info:
-        return slot, None, "reservation details failed"
-
-    # Check if another thread already succeeded — skip cart/add if so
-    if success_event.is_set():
-        log.info(f"  [stagger] {display_time}: another slot already won, skipping cart/add")
-        return slot, None, "skipped — another slot won"
-
-    log.info(f"  [stagger] {display_time}: adding to cart...")
-    cart_resp, error_msg = add_to_cart(
-        session, preferred_entry, rate_info, num_players,
-        contact_id, session_id, csrf_token,
-    )
-    if cart_resp:
-        success_event.set()  # signal other threads to skip
-    return slot, cart_resp, error_msg
-
-
-# Delay between staggered slot launches (seconds)
-STAGGER_DELAY = float(os.getenv("STAGGER_DELAY", "0.5"))
-
-
-def staggered_book_slots(session, slots, session_id, csrf_token, contact_id, num_players):
-    """Fire reservation + cart/add for slots with staggered starts.
-
-    Launches each slot STAGGER_DELAY apart. A shared Event prevents later
-    slots from calling cart/add once an earlier slot succeeds, so at most
-    one tee time is held under normal conditions.
+    Reservation calls are read-only and safe to race. Cart/add modifies the
+    session-scoped cart, so it is serialized to keep semantics simple and
+    avoid cross-thread cart pollution. The first slot whose cart/add yields
+    the full requested player count wins; partial fills are rejected by
+    add_to_cart (which clears the cart) and the loop moves on.
 
     Returns (winning_slot, cart_resp, failures).
     """
-    success_event = threading.Event()
     failures = []
 
+    # Phase A: parallel reservation fetch (no side effects)
+    log.info(f"  Fetching reservation details for {len(slots)} candidates in parallel...")
+    reservations = {}
     with ThreadPoolExecutor(max_workers=len(slots)) as pool:
-        futures = {}
-        for i, slot in enumerate(slots):
-            if success_event.is_set():
-                log.info(f"  [stagger] Skipping {slot['display_time']} — already have a winner")
-                break
-            futures[pool.submit(
-                try_book_slot, session, slot,
-                session_id, csrf_token, contact_id, num_players,
-                success_event,
-            )] = slot
-            # Stagger: wait before launching next slot (except after the last one)
-            if i < len(slots) - 1:
-                time.sleep(STAGGER_DELAY)
+        future_to_slot = {
+            pool.submit(get_reservation_details, session, slot, session_id): slot
+            for slot in slots
+        }
+        for future in as_completed(future_to_slot):
+            slot = future_to_slot[future]
+            try:
+                reservations[slot["datetime"]] = future.result()
+            except Exception as e:
+                log.warning(f"  Reservation fetch raised for {slot['display_time']}: {e}")
+                reservations[slot["datetime"]] = None
 
-        for future in as_completed(futures):
-            slot, cart_resp, error_msg = future.result()
-            if cart_resp:
-                log.info(f"  [stagger] Winner: {slot['display_time']}")
-                return slot, cart_resp, failures
-            else:
-                failures.append((slot, error_msg))
-                log.info(f"  [stagger] Failed: {slot['display_time']} — {error_msg or 'unknown'}")
+    # Phase B: sequential cart/add — first full-count winner takes it
+    for slot in slots:
+        rate_info = reservations.get(slot["datetime"])
+        if not rate_info:
+            failures.append((slot, "reservation details failed"))
+            log.warning(f"  {slot['display_time']}: skipping — no reservation details")
+            continue
+
+        preferred_entry = get_preferred_entry(slot, PREFERRED_SPONSOR_ID)
+        if not preferred_entry:
+            failures.append((slot, "no preferred entry"))
+            continue
+
+        log.info(f"  {slot['display_time']}: attempting cart/add...")
+        cart_resp, error_msg = add_to_cart(
+            session, preferred_entry, rate_info, num_players,
+            contact_id, session_id, csrf_token,
+        )
+        if cart_resp:
+            log.info(f"  Winner: {slot['display_time']}")
+            return slot, cart_resp, failures
+
+        failures.append((slot, error_msg))
+        log.info(f"  {slot['display_time']}: failed — {error_msg or 'unknown'}, trying next")
 
     return None, None, failures
 
@@ -784,13 +801,13 @@ async def main():
 
     if race_candidates:
         log.info("=" * 60)
-        log.info(f"STAGGERED RACE: {len(race_candidates)} slots, {STAGGER_DELAY:.1f}s apart")
+        log.info(f"WAVE 1: {len(race_candidates)} candidates (parallel reservations, sequential cart/add)")
         for rc in race_candidates:
             pe = get_preferred_entry(rc, PREFERRED_SPONSOR_ID)
             log.info(f"  {rc['display_time']} — {rc['available_players']}p — ${pe['r08'] if pe else '?'}")
         log.info("=" * 60)
 
-        winning_slot, cart_resp, failures = staggered_book_slots(
+        winning_slot, cart_resp, failures = book_candidates(
             session, race_candidates, session_id, csrf_token, contact_id, NUM_PLAYERS,
         )
         attempts_used = len(race_candidates)
@@ -798,7 +815,7 @@ async def main():
         if cart_resp:
             best_slot = winning_slot
         else:
-            log.warning(f"Parallel race: all {len(race_candidates)} slots failed")
+            log.warning(f"Wave 1: all {len(race_candidates)} candidates failed")
             # Check failures for alternative time hints
             for failed_slot, error_msg in failures:
                 if error_msg:
