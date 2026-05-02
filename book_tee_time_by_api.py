@@ -582,6 +582,8 @@ def hold_reservation(session, contact_id, session_id):
         "SessionID": session_id,
         "MasterSponsorID": str(MASTER_SPONSOR_ID),
     }, "hold reservation")
+    if hold_resp:
+        log.info(f"  hold response body: {json.dumps(hold_resp)}")
     return hold_resp
 
 
@@ -594,6 +596,8 @@ def check_conflicts(session, preferred_entry, contact_id):
         "SponsorID": str(PREFERRED_SPONSOR_ID),
         "TeeTime": preferred_entry["r15"],  # datetime string
     }, "check conflicts")
+    if conflict_resp:
+        log.info(f"  conflicts response body: {json.dumps(conflict_resp)}")
     return conflict_resp
 
 
