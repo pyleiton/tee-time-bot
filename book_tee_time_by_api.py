@@ -62,6 +62,16 @@ RE_SEARCH_THRESHOLD = int(os.getenv("RE_SEARCH_THRESHOLD", "3"))
 MAX_ALT_TIME_MINS = int(os.getenv("MAX_ALT_TIME_MINS", "720"))
 # Number of time slots to try in parallel on the first booking wave
 PARALLEL_SLOTS = int(os.getenv("PARALLEL_SLOTS", "3"))
+# Skip the at-drop poll: first post-drop poll fires at drop + this many ms.
+# The EZLinks server flaps briefly at the exact drop instant (cache invalidation
+# / DB writes), and a poll arriving in that window returns 400. Landing slightly
+# after avoids the disruption window.
+DROP_OFFSET_MS = int(os.getenv("DROP_OFFSET_MS", "500"))
+# On a transient HTTP failure during polling, fast-retry on this delay instead
+# of waiting the full POLL_INTERVAL. Cap on consecutive fast retries before
+# falling back to normal cadence.
+FAST_RETRY_DELAY_MS = int(os.getenv("FAST_RETRY_DELAY_MS", "500"))
+MAX_FAST_RETRIES = int(os.getenv("MAX_FAST_RETRIES", "6"))
 
 # Set up logging — logs/ directory with daily rotation
 # Reconfigure stdout to UTF-8 so non-cp1252 chars in scraped page text
@@ -143,6 +153,26 @@ def minutes_to_time(mins: int) -> str:
     elif h > 12:
         h -= 12
     return f"{h}:{m:02d} {period}"
+
+
+def compute_next_poll_sleep_secs(drop_time, poll_interval):
+    """How long to sleep before the next poll, skipping the at-drop window.
+
+    The booking server appears to flap briefly at the exact drop instant
+    (cache invalidation, DB writes). A poll landing in [drop, drop+offset]
+    catches the disruption and is likely to return 400. If the natural-cadence
+    next poll would land in that window, push it to drop+offset instead.
+
+    Returns seconds to sleep (clamped to >= 0).
+    """
+    now = datetime.now()
+    natural_next = now + timedelta(seconds=poll_interval)
+    drop_with_offset = drop_time + timedelta(milliseconds=DROP_OFFSET_MS)
+    if drop_time <= natural_next < drop_with_offset:
+        target = drop_with_offset
+    else:
+        target = natural_next
+    return max(0.0, (target - datetime.now()).total_seconds())
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +448,13 @@ def login(session):
 
 
 def search_tee_times(session, target_date_str, num_players):
-    """Search for tee times on a given date. Returns (all_times, rate_types)."""
+    """Search for tee times on a given date.
+
+    Returns (tee_times, rate_types, ok). `ok` is True if the HTTP call
+    succeeded (200 with parseable JSON), False if it failed (non-200 or
+    no body). Callers that need to distinguish a transient server error
+    from a legitimate empty result use the `ok` flag.
+    """
     log.info(f"Step 3: Searching tee times for {target_date_str}, {num_players} players...")
     search_resp = api_post(session, "/api/search/search", {
         "p01": [COURSE_ID],
@@ -431,11 +467,11 @@ def search_tee_times(session, target_date_str, num_players):
     }, "search tee times")
 
     if not search_resp:
-        return [], []
+        return [], [], False
 
     tee_times = search_resp.get("r06", [])
     rate_types = search_resp.get("r05", [])
-    return tee_times, rate_types
+    return tee_times, rate_types, True
 
 
 def get_reservation_details(session, time_slot, session_id):
@@ -591,6 +627,13 @@ def book_candidates(session, slots, session_id, csrf_token, contact_id, num_play
         failures.append((slot, error_msg))
         log.info(f"  {slot['display_time']}: failed — {error_msg or 'unknown'}, trying next")
 
+        # Short-circuit: if the server suggested an alternative time, the
+        # remaining candidates (clustered near our target) are likely also
+        # stale. Bail to re-search instead of burning more cart/add round-trips.
+        if error_msg and parse_alternative_time(error_msg):
+            log.info(f"  Aborting Wave 1: server suggested an alternative — remaining candidates likely stale")
+            break
+
     return None, None, failures
 
 
@@ -734,6 +777,7 @@ async def main():
         poll_attempt = 0
         tee_times = []
         found_morning = False
+        consecutive_fast_retries = 0  # streak of HTTP-failure fast retries
 
         while datetime.now() < poll_deadline:
             poll_attempt += 1
@@ -741,7 +785,26 @@ async def main():
             log.info(f"Poll #{poll_attempt} at {now.strftime('%H:%M:%S')} "
                      f"(drop {'in ' + str(int((drop_time - now).total_seconds())) + 's' if now < drop_time else '+' + str(int((now - drop_time).total_seconds())) + 's'})")
 
-            tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+            tee_times, rate_types, ok = search_tee_times(session, target_date_str, NUM_PLAYERS)
+
+            if not ok:
+                # Transient HTTP failure (e.g. 400 at exact drop instant).
+                # Fast-retry burst before falling back to normal POLL_INTERVAL,
+                # so a 5-second sleep doesn't cost us the prime slots.
+                consecutive_fast_retries += 1
+                if consecutive_fast_retries <= MAX_FAST_RETRIES:
+                    log.info(f"  Search failed — fast retry "
+                             f"{consecutive_fast_retries}/{MAX_FAST_RETRIES} in {FAST_RETRY_DELAY_MS}ms")
+                    await asyncio.sleep(FAST_RETRY_DELAY_MS / 1000.0)
+                    continue
+                log.warning(f"  Search failed — falling back to POLL_INTERVAL after "
+                            f"{consecutive_fast_retries} fast retries")
+                consecutive_fast_retries = 0
+                await asyncio.sleep(compute_next_poll_sleep_secs(drop_time, POLL_INTERVAL))
+                continue
+
+            # HTTP success — clear the fast-retry streak
+            consecutive_fast_retries = 0
 
             # Check if morning times exist
             morning_times = [
@@ -753,7 +816,10 @@ async def main():
                 found_morning = True
                 break
 
-            await asyncio.sleep(POLL_INTERVAL)
+            # Successful poll, no morning times yet — sleep with drop-offset
+            # awareness so the natural-cadence next poll doesn't land in
+            # the at-drop disruption window.
+            await asyncio.sleep(compute_next_poll_sleep_secs(drop_time, POLL_INTERVAL))
 
         if not found_morning:
             log.warning(f"No morning times appeared after {poll_attempt} polls ({POLL_TIMEOUT_MIN} min timeout) — using best available")
@@ -762,7 +828,7 @@ async def main():
             log.info(f"Not a drop run (DAYS_OUT={DAYS_OUT}), searching immediately...")
         else:
             log.info("Booking window already open, searching immediately...")
-        tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+        tee_times, rate_types, _ = search_tee_times(session, target_date_str, NUM_PLAYERS)
 
     if not tee_times:
         log.error("No tee times found!")
@@ -829,7 +895,7 @@ async def main():
                         alt_mins = time_to_minutes(alt_time_str)
                         if alt_mins < MAX_ALT_TIME_MINS:
                             log.info(f"API suggests {alt_time_str} — re-searching for fresh results")
-                            tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+                            tee_times, rate_types, _ = search_tee_times(session, target_date_str, NUM_PLAYERS)
                             if tee_times:
                                 time_slots = group_tee_times(tee_times)
                                 tried_datetimes.clear()
@@ -844,7 +910,7 @@ async def main():
         for attempt in range(attempts_used, MAX_ATTEMPTS):
             if consecutive_stale >= RE_SEARCH_THRESHOLD:
                 log.info(f"Re-searching after {consecutive_stale} consecutive stale failures...")
-                tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+                tee_times, rate_types, _ = search_tee_times(session, target_date_str, NUM_PLAYERS)
                 if tee_times:
                     time_slots = group_tee_times(tee_times)
                     log.info(f"Re-search found {len(time_slots)} time slots")
@@ -887,7 +953,7 @@ async def main():
                         alt_mins = time_to_minutes(alt_time_str)
                         if alt_mins < MAX_ALT_TIME_MINS:
                             log.info(f"API suggests {alt_time_str} — re-searching for fresh results")
-                            tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+                            tee_times, rate_types, _ = search_tee_times(session, target_date_str, NUM_PLAYERS)
                             if tee_times:
                                 time_slots = group_tee_times(tee_times)
                                 tried_datetimes.clear()
